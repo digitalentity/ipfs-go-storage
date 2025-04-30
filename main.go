@@ -18,6 +18,7 @@ var (
 	p2pPort  = flag.Int("port", 4002, "Port for libP2P host")
 )
 
+// makeLibP2PHost creates a new libp2p host with the given port.
 func makeLibP2PHost(port int) (host.Host, string, error) {
 	r := rand.Reader
 
@@ -48,6 +49,7 @@ func makeLibP2PHost(port int) (host.Host, string, error) {
 	return h, addr.Encapsulate(hostAddr).String(), nil
 }
 
+// main is the entry point of the application.
 func main() {
 	_, cancel := context.WithCancel(context.Background())
 
