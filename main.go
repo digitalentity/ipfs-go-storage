@@ -28,6 +28,46 @@ var (
 	mountPoint = flag.String("mountpoint", "", "Path to mount the filesystem at")
 )
 
+type IPFSFileHandle struct {
+	obj  *IPFSObject
+	mu   sync.Mutex
+	file files.File
+}
+
+func (fh *IPFSFileHandle) String() string {
+	return fh.obj.String()
+}
+
+func (fh *IPFSFileHandle) Close(ctx context.Context) error {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	log.Printf("IPFSFileHandle.Close(%s)", fh)
+	return fh.file.Close()
+}
+
+func (fh *IPFSFileHandle) Read(ctx context.Context, dest []byte, off int64) (int, error) {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	log.Printf("IPFSFileHandle.Read(%s)", fh)
+
+	_, err := fh.file.Seek(off, io.SeekStart)
+	if err != nil {
+		return 0, fmt.Errorf("Read error [%w]", err)
+	}
+	n, err := fh.file.Read(dest)
+	if err == io.EOF {
+		err = nil
+	}
+	return n, err
+}
+
+func (fh *IPFSFileHandle) Size(ctx context.Context) (int64, error) {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	log.Printf("IPFSFileHandle.Size(%s)", fh)
+	return fh.file.Size()
+}
+
 type IPFSObject struct {
 	// Connector to the IPFS BitSwap service
 	ipfs *ipfs.IPFSConnector
@@ -42,9 +82,6 @@ type IPFSObject struct {
 
 	lastError    error     // Cached error
 	errorTimeout time.Time // Error timeout
-
-	fileTimeout time.Time  // Opened file timeout
-	file        files.File // A handle to the file (when opened)
 }
 
 func NewIPFSObject(ipfs *ipfs.IPFSConnector, id string) (*IPFSObject, error) {
@@ -61,22 +98,12 @@ func NewIPFSObject(ipfs *ipfs.IPFSConnector, id string) (*IPFSObject, error) {
 	}, nil
 }
 
-func (o *IPFSObject) open(ctx context.Context) error {
+func (o *IPFSObject) open(ctx context.Context) (*IPFSFileHandle, error) {
 	log.Printf("IPFSObject.open(%s)", o)
-
-	// Check if the file is already open.
-	if o.file != nil {
-		return nil
-	}
-
-	// Sanity check: this should never happen
-	if o.fileOpenCount > 0 {
-		log.Panicf("IPFSObject.open: fileOpenCount > 0 but file pointer is nil")
-	}
 
 	// Return the last error if it did not expire yet.
 	if o.lastError != nil && o.errorTimeout.After(time.Now()) {
-		return o.lastError
+		return nil, o.lastError
 	}
 
 	uf, err := o.ipfs.GetUnixfile(ctx, o.cid)
@@ -84,76 +111,50 @@ func (o *IPFSObject) open(ctx context.Context) error {
 		log.Printf("IPFSObject.open(%s): %v", o, err)
 		o.lastError = fmt.Errorf("Open error [%w]", err)
 		o.errorTimeout = time.Now().Add(IPFSObjectErrorTimeout)
-		return o.lastError
+		return nil, o.lastError
 	}
 
-	o.file = uf.(files.File)
-	o.fileOpenCount = 1
+	fh := &IPFSFileHandle{
+		obj:  o,
+		file: uf.(files.File),
+	}
 
-	log.Printf("IPFSObject.open(%s) success", o)
-	return nil
+	return fh, nil
 }
 
-func (o *IPFSObject) close(ctx context.Context) error {
-	if o.file == nil {
-		return nil
-	}
+// func (o *IPFSObject) read(ctx context.Context, dest []byte, off int64) (int, error) {
+// 	if o.file == nil {
+// 		return 0, fmt.Errorf("Read error: file is not open")
+// 	}
 
-	// Sanity check
-	if o.fileOpenCount <= 0 && o.file != nil {
-		log.Panicf("IPFSObject.close: fileOpenCount <= 0 but file pointer is not nil")
-	}
+// 	_, err := o.file.Seek(off, io.SeekStart)
+// 	if err != nil {
+// 		return 0, fmt.Errorf("Read error [%w]", err)
+// 	}
 
-	o.fileOpenCount--
-	if o.fileOpenCount > 0 {
-		return nil
-	}
+// 	n, err := o.file.Read(dest)
+// 	if err == io.EOF {
+// 		err = nil
+// 	}
 
-	// Close the file. Invalidate the file object even if we had an error here
-	err := o.file.Close()
-	o.file = nil
+// 	if err != nil {
+// 		return n, fmt.Errorf("Read error [%w]", err)
+// 	}
 
-	if err != nil {
-		log.Printf("IPFSObject.close(%s): %v", o, err)
-		return err
-	}
-
-	log.Printf("IPFSObject.close(%s) success", o)
-	return nil
-}
-
-func (o *IPFSObject) read(ctx context.Context, dest []byte, off int64) (int, error) {
-	if o.file == nil {
-		return 0, fmt.Errorf("Read error: file is not open")
-	}
-
-	_, err := o.file.Seek(off, io.SeekStart)
-	if err != nil {
-		return 0, fmt.Errorf("Read error [%w]", err)
-	}
-
-	n, err := o.file.Read(dest)
-	if err == io.EOF {
-		err = nil
-	}
-
-	if err != nil {
-		return n, fmt.Errorf("Read error [%w]", err)
-	}
-
-	return n, nil
-}
+// 	return n, nil
+// }
 
 func (o *IPFSObject) fetchAttributes(ctx context.Context) error {
 	if o.attrValid {
 		return nil
 	}
 
-	if err := o.open(ctx); err != nil {
+	fh, err := o.open(ctx)
+	if err != nil {
 		return err
 	}
 
-	size, err := o.file.Size()
+	size, err := fh.Size(ctx)
 	if err != nil {
 		return err
 	}
@@ -161,10 +162,7 @@ func (o *IPFSObject) fetchAttributes(ctx context.Context) error {
 	o.attr.Size = uint64(size)
 	o.attrValid = true
 
-	if err := o.close(ctx); err != nil {
-		return err
-	}
-
+	fh.Close(ctx)
 	return nil
 }
 
@@ -181,23 +179,18 @@ func (o *IPFSObject) GetAttr(ctx context.Context) (*vfs.VFSObjectAttr, error) {
 	return &o.attr, nil
 }
 
-func (o *IPFSObject) Open(ctx context.Context) error {
+func (o *IPFSObject) Open(ctx context.Context) (vfs.VFSObjectHandle, error) {
+	log.Printf("IPFSObject.Open(%s)", o)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.open(ctx)
 }
 
-func (o *IPFSObject) Close(ctx context.Context) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.close(ctx)
-}
-
-func (o *IPFSObject) Read(ctx context.Context, dest []byte, off int64) (int, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.read(ctx, dest, off)
-}
+// func (o *IPFSObject) Read(ctx context.Context, dest []byte, off int64) (int, error) {
+// 	o.mu.Lock()
+// 	defer o.mu.Unlock()
+// 	return o.read(ctx, dest, off)
+// }
 
 func BuildObjectSet(ctx context.Context, ipfs *ipfs.IPFSConnector) (map[string]vfs.VFSObject, error) {
 	objectset := make(map[string]vfs.VFSObject)

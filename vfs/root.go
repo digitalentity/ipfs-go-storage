@@ -21,6 +21,8 @@ type VFSRoot struct {
 	objectset map[string]VFSObject // Map from a path to an object (for files)
 }
 
+var _ = (fs.NodeOnAdder)((*VFSRoot)(nil))
+
 func NewVFSRoot(objectset map[string]VFSObject) *VFSRoot {
 	root := &VFSRoot{}
 	root.objectset = objectset
