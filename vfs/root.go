@@ -8,18 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // No actual file data is stored in the VFS.
-
-type VFSObject interface {
-	Size() uint64
-	ModTime() time.Time
-}
 
 type VFSRoot struct {
 	fs.Inode

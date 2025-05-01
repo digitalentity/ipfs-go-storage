@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"flag"
 	"fmt"
+	"io"
+	"ipfs-go-storage/ipfs"
 	"ipfs-go-storage/mount"
 	"ipfs-go-storage/vfs"
 	"log"
@@ -14,24 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ipfs/go-cid"
-	"github.com/ipfs/go-datastore"
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
-
-	bsclient "github.com/ipfs/boxo/bitswap/client"
-	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
-	"github.com/ipfs/boxo/blockservice"
-	blockstore "github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/files"
-	"github.com/ipfs/boxo/ipld/merkledag"
-	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
+	"github.com/ipfs/go-cid"
 )
 
-const ipfsFetchTimeout = 10 * time.Second
+const IPFSObjectErrorTimeout = 10 * time.Second
+const IPFSUnixFileTimeout = 60 * time.Second // Cache open file object for 60 seconds
 
 var (
 	ipfsPeer   = flag.String("bitswap-peer", "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWPzN6y3VHiWVTSqf4R3yuEWjtaZhjDPZhiYH7q1bBiGVi", "IPFS peer address to connect to")
@@ -39,74 +28,194 @@ var (
 	mountPoint = flag.String("mountpoint", "", "Path to mount the filesystem at")
 )
 
-// makeLibP2PHost creates a new libp2p host with the given port.
-func makeLibP2PHost(port int) (host.Host, string, error) {
-	r := rand.Reader
-
-	// Generate a new key pair for the host
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Basic LibP2P options
-	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)),
-		libp2p.Identity(priv),
-	}
-
-	h, err := libp2p.New(opts...)
-	if err != nil {
-		return nil, "", err
-	}
-
-	hostAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s", h.ID().String()))
-	if err != nil {
-		return nil, "", err
-	}
-
-	addr := h.Addrs()[0]
-
-	return h, addr.Encapsulate(hostAddr).String(), nil
-}
-
-type IPFSConnector struct {
-}
-
 type IPFSObject struct {
 	// Connector to the IPFS BitSwap service
-	ipfs *IPFSConnector
+	ipfs *ipfs.IPFSConnector
 
-	// Persistent metadata
-	pubTime time.Time // Time the object was published on the VFS
+	// Object CID and VFS metadata
+	cid cid.Cid
 
-	// Metadata
-	mu            sync.Mutex
-	metadataReady bool
-	cid           cid.Cid
-	size          uint64
+	// Run-time object state
+	mu        sync.Mutex
+	attrValid bool              // Attributes fetch was successful. VFS is read-only, so this needs to happen only once.
+	attr      vfs.VFSObjectAttr // Cached attributes
+
+	lastError    error     // Cached error
+	errorTimeout time.Time // Error timeout
+
+	fileTimeout time.Time  // Opened file timeout
+	file        files.File // A handle to the file (when opened)
 }
 
-func (o *IPFSObject) refreshMetadata() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if o.metadataReady {
-		return
+func NewIPFSObject(ipfs *ipfs.IPFSConnector, id string) (*IPFSObject, error) {
+	c, err := cid.Parse(id)
+	if err != nil {
+		return nil, err
 	}
 
-	o.size = 1024
-
-	o.metadataReady = true
+	return &IPFSObject{
+		ipfs:      ipfs,
+		cid:       c,
+		attr:      vfs.VFSObjectAttr{ModTime: time.Now()},
+		attrValid: false,
+	}, nil
 }
 
-func (o *IPFSObject) Size() uint64 {
-	o.refreshMetadata()
-	return o.size
+func (o *IPFSObject) open(ctx context.Context) error {
+	log.Printf("IPFSObject.open(%s)", o)
+
+	// Check if the file is already open.
+	if o.file != nil {
+		return nil
+	}
+
+	// Sanity check: this should never happen
+	if o.fileOpenCount > 0 {
+		log.Panicf("IPFSObject.open: fileOpenCount > 0 but file pointer is nil")
+	}
+
+	// Return the last error if it did not expire yet.
+	if o.lastError != nil && o.errorTimeout.After(time.Now()) {
+		return o.lastError
+	}
+
+	uf, err := o.ipfs.GetUnixfile(ctx, o.cid)
+	if err != nil {
+		log.Printf("IPFSObject.open(%s): %v", o, err)
+		o.lastError = fmt.Errorf("Open error [%w]", err)
+		o.errorTimeout = time.Now().Add(IPFSObjectErrorTimeout)
+		return o.lastError
+	}
+
+	o.file = uf.(files.File)
+	o.fileOpenCount = 1
+
+	log.Printf("IPFSObject.open(%s) success", o)
+	return nil
 }
 
-func (o *IPFSObject) ModTime() time.Time {
-	return o.pubTime
+func (o *IPFSObject) close(ctx context.Context) error {
+	if o.file == nil {
+		return nil
+	}
+
+	// Sanity check
+	if o.fileOpenCount <= 0 && o.file != nil {
+		log.Panicf("IPFSObject.close: fileOpenCount <= 0 but file pointer is not nil")
+	}
+
+	o.fileOpenCount--
+	if o.fileOpenCount > 0 {
+		return nil
+	}
+
+	// Close the file. Invalidate the file object even if we had an error here
+	err := o.file.Close()
+	o.file = nil
+
+	if err != nil {
+		log.Printf("IPFSObject.close(%s): %v", o, err)
+		return err
+	}
+
+	log.Printf("IPFSObject.close(%s) success", o)
+	return nil
+}
+
+func (o *IPFSObject) read(ctx context.Context, dest []byte, off int64) (int, error) {
+	if o.file == nil {
+		return 0, fmt.Errorf("Read error: file is not open")
+	}
+
+	_, err := o.file.Seek(off, io.SeekStart)
+	if err != nil {
+		return 0, fmt.Errorf("Read error [%w]", err)
+	}
+
+	n, err := o.file.Read(dest)
+	if err == io.EOF {
+		err = nil
+	}
+
+	if err != nil {
+		return n, fmt.Errorf("Read error [%w]", err)
+	}
+
+	return n, nil
+}
+
+func (o *IPFSObject) fetchAttributes(ctx context.Context) error {
+	if o.attrValid {
+		return nil
+	}
+
+	if err := o.open(ctx); err != nil {
+		return err
+	}
+
+	size, err := o.file.Size()
+	if err != nil {
+		return err
+	}
+
+	o.attr.Size = uint64(size)
+	o.attrValid = true
+
+	if err := o.close(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (o *IPFSObject) String() string {
+	return o.cid.String()
+}
+
+func (o *IPFSObject) GetAttr(ctx context.Context) (*vfs.VFSObjectAttr, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err := o.fetchAttributes(ctx); err != nil {
+		return nil, err
+	}
+	return &o.attr, nil
+}
+
+func (o *IPFSObject) Open(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.open(ctx)
+}
+
+func (o *IPFSObject) Close(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.close(ctx)
+}
+
+func (o *IPFSObject) Read(ctx context.Context, dest []byte, off int64) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.read(ctx, dest, off)
+}
+
+func BuildObjectSet(ctx context.Context, ipfs *ipfs.IPFSConnector) (map[string]vfs.VFSObject, error) {
+	objectset := make(map[string]vfs.VFSObject)
+
+	data := map[string]string{
+		"/Anime/Kusuriya no Hitorigoto TV-2 01.mkv": "QmRR2wi98aHLfGf8Nu5MxM33BTrChyaQ9phNCHH2RF78WC",
+	}
+
+	for path, id := range data {
+		obj, err := NewIPFSObject(ipfs, id)
+		if err != nil {
+			return nil, err
+		}
+
+		objectset[path] = obj
+	}
+
+	return objectset, nil
 }
 
 // main is the entry point of the application.
@@ -118,97 +227,42 @@ func main() {
 	flag.Parse()
 	log.Println("Starting ipfs-go-storage...")
 
-	objectset := map[string]vfs.VFSObject{
-		"/Movies/Happy Death Day (2017)/Schastlivogo_dnya_smerti_2017_HDRip_r5_[scarabey.org].mkv": &IPFSObject{},
-		"/Movies/Venom (2018)/Веном_2018_BDRip.mkv":                                                &IPFSObject{},
+	// Create IPFS connector
+	ipfs, err := ipfs.NewIPFSConnector(*ipfsPeer, *p2pPort)
+	if err != nil {
+		log.Fatal(err)
 	}
 
+	// Start IPFS
+	if err := ipfs.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	defer ipfs.Close()
+
+	// Build the VFS ObjectSet
+	objectset, err := BuildObjectSet(ctx, ipfs)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Create the VFS
 	fs := vfs.NewVFSRoot(objectset)
 
+	// Mount the filesystem
 	mount, err := mount.NewMount(ctx, fs, *mountPoint)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer mount.Unmount()
+
+	log.Printf("Mounted at %s", mount.MountPoint())
 
 	fs.Print()
 
+	// Handle signals for graceful unmounting.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Unmounting...")
-	if err := mount.Unmount(); err != nil {
-		log.Printf("Failed to unmount: %v", err)
-	}
-
-	return
-
-	// Create LibP2P Host
-	h, haddr, err := makeLibP2PHost(*p2pPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer h.Close()
-
-	log.Printf("I am %s", haddr)
-
-	bsn := bsnet.NewFromIpfsHost(h)
-	bswap := bsclient.New(ctx, bsn, nil, blockstore.NewBlockstore(datastore.NewNullDatastore()))
-	bsn.Start(bswap)
-	defer bswap.Close()
-
-	// Turn the targetPeer into a multiaddr.
-	maddr, err := multiaddr.NewMultiaddr(*ipfsPeer)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Extract the peer ID from the multiaddr.
-	info, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Directly connect to the peer that we know has the content.
-	// Generally this peer will come from whatever content routing system is provided, however go-bitswap will also ask peers it is connected to for content so this will work.
-	if err := h.Connect(ctx, *info); err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Connected to %s", info.ID.String())
-
-	// c, err := cid.Parse("QmSnuWmxptJZdLJpKRarxBMS2Ju2oANVrgbr2xWbie9b2D") // Directory
-	c, err := cid.Parse("Qmc8mmzycvXnzgwBHokZQd97iWAmtdFMqX4FZUAQ5AQdQi") // File
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("CID: %s", c.String())
-
-	dserv := merkledag.NewReadOnlyDagService(merkledag.NewSession(ctx, merkledag.NewDAGService(blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), bswap))))
-
-	fetchCtx, _ := context.WithTimeout(ctx, ipfsFetchTimeout)
-	nd, err := dserv.Get(fetchCtx, c)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Now we need to figure out whether this is a file or a directory.
-	// We can do this by checking the node type.
-
-	uf, err := unixfile.NewUnixfsFile(ctx, dserv, nd)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fsize, err := uf.Size()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("File size: %d bytes", fsize)
-
-	if f, ok := uf.(files.File); ok {
-		f.Close()
-	} else {
-		log.Fatalf("expected a file")
-	}
+	log.Println("Shutting down ipfs-go-storage...")
 }
