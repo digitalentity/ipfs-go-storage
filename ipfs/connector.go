@@ -31,7 +31,7 @@ var (
 	ErrorNotAFile = errors.New("CID is not a UnixFile")
 )
 
-type IPFSConnector struct {
+type Connector struct {
 	// Initial settings
 	port int
 
@@ -46,8 +46,8 @@ type IPFSConnector struct {
 	dsvc  format.DAGService
 }
 
-// NewIPFSConnector creates a new IPFSConnector.
-func NewIPFSConnector(peerAddr string, listenPort int) (*IPFSConnector, error) {
+// NewConnector creates a new IPFSConnector.
+func NewConnector(peerAddr string, listenPort int) (*Connector, error) {
 	r := rand.Reader
 
 	// Turn the targetPeer into a multiaddr.
@@ -68,7 +68,7 @@ func NewIPFSConnector(peerAddr string, listenPort int) (*IPFSConnector, error) {
 		return nil, err
 	}
 
-	ipfs := &IPFSConnector{
+	ipfs := &Connector{
 		port:     listenPort,
 		peerInfo: info,
 		privKey:  priv,
@@ -79,7 +79,7 @@ func NewIPFSConnector(peerAddr string, listenPort int) (*IPFSConnector, error) {
 }
 
 // Start starts the IPFSConnector. On shutdown user must call Close()
-func (c *IPFSConnector) Start(ctx context.Context) error {
+func (c *Connector) Start(ctx context.Context) error {
 	var err error
 
 	// Basic LibP2P options
@@ -123,14 +123,14 @@ func (c *IPFSConnector) Start(ctx context.Context) error {
 	return nil
 }
 
-func (c *IPFSConnector) Close() error {
+func (c *Connector) Close() error {
 	c.bswap.Close()
 	c.host.Close()
 	return nil
 }
 
-func (c *IPFSConnector) GetUnixfile(ctx context.Context, id cid.Cid) (files.Node, error) {
-	log.Printf("IPFSConnector.GetUnixfile(%s)", id.String())
+func (c *Connector) GetUnixfile(ctx context.Context, id cid.Cid) (files.Node, error) {
+	log.Printf("ipfs.Connector.GetUnixfile(%s)", id.String())
 
 	fetchCtx, _ := context.WithTimeout(ctx, IPFSFetchTimeout)
 	node, err := c.dsvc.Get(fetchCtx, id)
