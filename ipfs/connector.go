@@ -1,24 +1,28 @@
 package ipfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"ipfs-go-storage/config"
-	"log"
+	"ipfs-go-storage/ipfs/datastore"
 	"time"
 
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/files"
 	"github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/boxo/ipns"
 	"github.com/ipfs/go-cid"
-	"github.com/ipfs/go-datastore"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 
 	bsclient "github.com/ipfs/boxo/bitswap/client"
@@ -26,31 +30,48 @@ import (
 	blockstore "github.com/ipfs/boxo/blockstore"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	format "github.com/ipfs/go-ipld-format"
-	eventbus "github.com/libp2p/go-libp2p/core/event"
 )
 
 const IPFSFetchTimeout = 1 * time.Second
 const IPFSHealthcheckTicker = 10 * time.Second
 
 var (
-	ErrorNotAFile = errors.New("CID is not a UnixFile")
+	ErrorNotAFile     = errors.New("CID is not a UnixFile")
+	ErrorFileTooLarge = errors.New("File is too large")
 )
+
+type bitswapInfo struct {
+	privKey  crypto.PrivKey
+	pubKey   crypto.PubKey
+	peerInfo *peer.AddrInfo
+}
+
+type ipnsInfo struct {
+	privKey    crypto.PrivKey
+	pubKey     crypto.PubKey
+	peerID     peer.ID
+	ipnsKey    ipns.Name
+	canPublish bool // Private Key valid
+	canResolve bool // Public Key valid
+}
 
 type Connector struct {
 	// Initial settings
 	cfg *config.Config
 
 	// Private and Public keys for a new LibP2P Host
-	privKey  crypto.PrivKey
-	pubKey   crypto.PubKey
-	peerInfo *peer.AddrInfo
+	bitswap bitswapInfo
+
+	// Private/Public keys + Peer ID for an IPNS Publisher
+	// This info is shared amongst subscribers of the same VFS ObjectSet
+	ipns ipnsInfo
 
 	// Run-time state
 	ticker *time.Ticker
 	host   host.Host
 	bswap  *bsclient.Client
 	dsvc   format.DAGService
-	evsub  eventbus.Subscription
+	evsub  event.Subscription
 	done   chan bool
 }
 
@@ -77,29 +98,60 @@ func NewConnector(cfg *config.Config) (*Connector, error) {
 	}
 
 	ipfs := &Connector{
-		cfg:      cfg,
-		peerInfo: info,
-		privKey:  priv,
-		pubKey:   pub,
-		done:     make(chan bool),
+		cfg: cfg,
+		bitswap: bitswapInfo{
+			privKey:  priv,
+			pubKey:   pub,
+			peerInfo: info,
+		},
+		ipns: ipnsInfo{
+			privKey:    cfg.Publisher.PrivKey.PrivKey,
+			pubKey:     cfg.Publisher.PubKey.PubKey,
+			canPublish: cfg.Publisher.PrivKey.Valid(),
+			canResolve: cfg.Publisher.PubKey.Valid(),
+		},
+		done: make(chan bool),
+	}
+
+	// Verify that Publisher peerID matches the Private Key (if valid)
+	if cfg.Publisher.PubKey.Valid() {
+		pid, err := peer.IDFromPublicKey(cfg.Publisher.PubKey.PubKey)
+		if err != nil {
+			return nil, err
+		}
+
+		ipfs.ipns.peerID = pid
+		ipfs.ipns.ipnsKey = ipns.NameFromPeer(pid)
+		log.Infof("IPNS Key: %s", ipfs.ipns.ipnsKey.String())
 	}
 
 	return ipfs, nil
 }
 
 func (c *Connector) connectionHealthcheck(ctx context.Context) {
-	log.Printf("ipfs.Connector.connectionHealthcheck()")
+	log.Debugf("ipfs.Connector.connectionHealthcheck()")
 
 	// for _, conn := range c.host.Network().Conns() {
 	// 	log.Printf("Connection to %s: %v", conn.RemotePeer().String(), conn.Stat().Stats)
 	// }
 
 	// Check if we are connected to the target peer
-	if c.host.Network().Connectedness(c.peerInfo.ID) == network.NotConnected {
-		log.Printf("Not connected to %s, reconnecting...", c.peerInfo.ID.String())
-		if err := c.host.Connect(ctx, *c.peerInfo); err == nil {
-			log.Printf("Reconnected to %s", c.peerInfo.String())
+	if c.host.Network().Connectedness(c.bitswap.peerInfo.ID) == network.NotConnected {
+		log.Warningf("Not connected to %s, reconnecting...", c.bitswap.peerInfo.ID.String())
+		if err := c.host.Connect(ctx, *c.bitswap.peerInfo); err == nil {
+			log.Infof("Reconnected to %s", c.bitswap.peerInfo.String())
 		}
+	}
+}
+
+func (c *Connector) processEvent(ctx context.Context, evt interface{}) {
+	switch evt.(type) {
+	case event.EvtPeerConnectednessChanged:
+		e := evt.(event.EvtPeerConnectednessChanged)
+		log.Debugf("EvtPeerConnectednessChanged: %s -> %s\n", e.Peer.String(), e.Connectedness.String())
+	case event.EvtLocalReachabilityChanged:
+		e := evt.(event.EvtLocalReachabilityChanged)
+		log.Debugf("EvtLocalReachabilityChanged: %s\n", e.Reachability.String())
 	}
 }
 
@@ -111,7 +163,7 @@ func (c *Connector) eventListener(ctx context.Context) {
 		case <-c.ticker.C:
 			c.connectionHealthcheck(ctx)
 		case evt := <-c.evsub.Out():
-			log.Printf("Event: %v", evt)
+			c.processEvent(ctx, evt)
 		}
 	}
 }
@@ -120,10 +172,21 @@ func (c *Connector) eventListener(ctx context.Context) {
 func (c *Connector) Start(ctx context.Context) error {
 	var err error
 
+	// Connection manager
+	connmgr, err := connmgr.NewConnManager(
+		100, // Lowwater
+		400, // HighWater,
+		connmgr.WithGracePeriod(time.Minute),
+	)
+
 	// Basic LibP2P options
 	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", c.cfg.IPFS.Port)),
-		libp2p.Identity(c.privKey),
+		libp2p.Identity(c.bitswap.privKey),
+		libp2p.ListenAddrStrings(
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", c.cfg.IPFS.Port),
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", c.cfg.IPFS.Port),
+		),
+		libp2p.ConnectionManager(connmgr),
 	}
 
 	// Start a new libp2p Host
@@ -139,18 +202,24 @@ func (c *Connector) Start(ctx context.Context) error {
 	}
 
 	thisAddr := c.host.Addrs()[0].Encapsulate(hostAddr).String()
-	log.Printf("I am %s", thisAddr)
+	log.Infof("I am %s", thisAddr)
+
+	// Datastore
+	//ds := dsync.MutexWrap(datastore.NewMapDatastore())
+	ds := datastore.NewMemCacheDatastore(1 * time.Minute)
+	bs := blockstore.NewBlockstore(ds)
+	bs = blockstore.NewIdStore(bs)
 
 	// Create a new bitswap client
 	bsn := bsnet.NewFromIpfsHost(c.host)
-	c.bswap = bsclient.New(ctx, bsn, nil, blockstore.NewBlockstore(datastore.NewNullDatastore()))
+	c.bswap = bsclient.New(ctx, bsn, nil, bs)
 	bsn.Start(c.bswap)
 
-	// Create a new DAGService
-	c.dsvc = merkledag.NewReadOnlyDagService(merkledag.NewSession(ctx, merkledag.NewDAGService(blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), c.bswap))))
+	bsrv := blockservice.New(bs, c.bswap)
+	c.dsvc = merkledag.NewDAGService(bsrv)
 
 	// Subscribe to event bus
-	if c.evsub, err = c.host.EventBus().Subscribe(eventbus.WildcardSubscription); err != nil {
+	if c.evsub, err = c.host.EventBus().Subscribe(event.WildcardSubscription); err != nil {
 		c.bswap.Close()
 		c.host.Close()
 		return err
@@ -163,19 +232,15 @@ func (c *Connector) Start(ctx context.Context) error {
 	go c.eventListener(ctx)
 
 	// Connect to the target peer
-	if err = c.host.Connect(ctx, *c.peerInfo); err != nil {
-		log.Printf("Failed to connect to %s: %s", c.peerInfo.String(), err.Error())
-		// c.bswap.Close()
-		// c.host.Close()
-		// return err
-	} else {
-		log.Printf("Connected to %s", c.peerInfo.String())
+	if err = c.host.Connect(ctx, *c.bitswap.peerInfo); err != nil {
+		log.Warningf("Failed to connect to %s: %s", c.bitswap.peerInfo.String(), err.Error())
+		// This is not a fault.
 	}
 
 	// Start the goroutine to execute a graceful shutdown
 	go func() {
 		<-ctx.Done()
-		log.Printf("Context cancelled, shutting down IPFS connector...")
+		log.Infof("Context cancelled, shutting down IPFS connector...")
 		c.Close()
 	}()
 
@@ -183,7 +248,7 @@ func (c *Connector) Start(ctx context.Context) error {
 }
 
 func (c *Connector) Close() error {
-	log.Printf("ipfs.Connector.Close()")
+	log.Debugf("ipfs.Connector.Close()")
 	c.evsub.Close()
 	c.bswap.Close()
 	c.host.Close()
@@ -202,7 +267,7 @@ func (c *Connector) WaitDone() error {
 }
 
 func (c *Connector) GetUnixfile(ctx context.Context, id cid.Cid) (files.Node, error) {
-	log.Printf("ipfs.Connector.GetUnixfile(%s)", id.String())
+	log.Debugf("ipfs.Connector.GetUnixfile(%s)", id.String())
 
 	fetchCtx, _ := context.WithTimeout(ctx, IPFSFetchTimeout)
 	node, err := c.dsvc.Get(fetchCtx, id)
@@ -220,4 +285,34 @@ func (c *Connector) GetUnixfile(ctx context.Context, id cid.Cid) (files.Node, er
 	}
 
 	return uf, nil
+}
+
+func (c *Connector) FetchUnixFile(ctx context.Context, id cid.Cid) ([]byte, error) {
+	log.Debugf("ipfs.Connector.FetchUnixFile(%s)", id.String())
+
+	uf, err := c.GetUnixfile(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer uf.Close()
+
+	if size, err := uf.Size(); err != nil {
+		log.Errorf("ipfs.Connector.FetchUnixFile(%s): %v", id.String(), err)
+		return nil, err
+	} else if size > IPFSUnixFileMaxSize {
+		log.Errorf("ipfs.Connector.FetchUnixFile(%s): File is too large (%d bytes)", id.String(), size)
+		return nil, ErrorFileTooLarge
+	}
+
+	var buf bytes.Buffer
+	if f, ok := uf.(files.File); ok {
+		if _, err := io.Copy(&buf, f); err != nil {
+			log.Errorf("ipfs.Connector.FetchUnixFile(%s): %v", id.String(), err)
+			return nil, err
+		}
+	}
+
+	log.Debugf("ipfs.Connector.FetchUnixFile(%s): %d bytes", id.String(), buf.Len())
+
+	return buf.Bytes(), nil
 }

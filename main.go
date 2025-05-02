@@ -5,12 +5,15 @@ import (
 	"flag"
 	"ipfs-go-storage/commands"
 	"ipfs-go-storage/config"
-	"log"
 	"os"
+
+	logging "github.com/ipfs/go-log/v2"
 )
 
+var log = logging.Logger("main")
+
 func RunPublish(ctx context.Context, cfg *config.Config) {
-	log.Println("Publishing ipfs-go-storage...")
+	log.Infof("Publishing ipfs-go-storage...")
 }
 
 // main is the entry point of the application.
@@ -18,8 +21,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	configFile := flag.String("config", "/tmp/ipfs-go-storage.yaml", "Path to config file")
+	logging.SetLogLevel("*", "debug")
 
+	configFile := flag.String("config", "/tmp/ipfs-go-storage.json", "Path to config file")
 	initCmd := flag.NewFlagSet("init", flag.ExitOnError)
 
 	mountCmd := flag.NewFlagSet("mount", flag.ExitOnError)

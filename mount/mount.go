@@ -6,17 +6,18 @@ package mount
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	logging "github.com/ipfs/go-log/v2"
 )
 
-var (
-	MountTimeout = time.Second * 5
-)
+var log = logging.Logger("mount")
+
+const MountTimeout = time.Second * 5
 
 // Mount represents a filesystem mount.
 type Mount interface {
@@ -41,7 +42,7 @@ func (m *mount) MountPoint() string {
 }
 
 func (m *mount) Unmount() error {
-	log.Printf("Unmount(%s)", m.mountpoint)
+	log.Debugf("Unmount(%s)", m.mountpoint)
 	if m.server == nil {
 		return fmt.Errorf("not mounted")
 	}
@@ -89,9 +90,9 @@ func NewMount(ctx context.Context, vfs fs.InodeEmbedder, mountpoint string) (Mou
 	// Start a function that would trigger the unmount
 	go func() {
 		<-ctx.Done()
-		log.Printf("Context cancelled, unmounting...")
+		log.Infof("Context cancelled, unmounting...")
 		if err := m.Unmount(); err != nil {
-			log.Printf("Failed to unmount: %v", err)
+			log.Errorf("Failed to unmount: %v", err)
 		}
 		m.done <- true
 	}()

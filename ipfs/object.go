@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"ipfs-go-storage/vfs"
-	"log"
 	"sync"
 	"time"
 
@@ -28,7 +27,7 @@ type Object struct {
 	errorTimeout time.Time // Error timeout
 }
 
-func NewIPFSObject(ipfs *Connector, id string) (*Object, error) {
+func NewObject(ipfs *Connector, id string) (*Object, error) {
 	c, err := cid.Parse(id)
 	if err != nil {
 		return nil, err
@@ -42,8 +41,8 @@ func NewIPFSObject(ipfs *Connector, id string) (*Object, error) {
 	}, nil
 }
 
-func (o *Object) open(ctx context.Context) (*FileHandle, error) {
-	log.Printf("ipfs.Object.open(%s)", o)
+func (o *Object) open(ctx context.Context) (*fileHandle, error) {
+	log.Debugf("ipfs.Object.open(%s)", o)
 
 	// Return the last error if it did not expire yet.
 	if o.lastError != nil && o.errorTimeout.After(time.Now()) {
@@ -52,13 +51,14 @@ func (o *Object) open(ctx context.Context) (*FileHandle, error) {
 
 	uf, err := o.ipfs.GetUnixfile(ctx, o.cid)
 	if err != nil {
-		log.Printf("ipfs.Object.open(%s): %v", o, err)
+		log.Errorf("ipfs.Object.open(%s): %v", o, err)
 		o.lastError = fmt.Errorf("Open error [%w]", err)
 		o.errorTimeout = time.Now().Add(IPFSObjectErrorTimeout)
 		return nil, o.lastError
 	}
 
-	fh := &FileHandle{
+	fh := &fileHandle{
+		mu:   sync.Mutex{},
 		obj:  o,
 		file: uf.(files.File),
 	}
@@ -102,14 +102,8 @@ func (o *Object) GetAttr(ctx context.Context) (*vfs.VFSObjectAttr, error) {
 }
 
 func (o *Object) Open(ctx context.Context) (vfs.VFSObjectHandle, error) {
-	log.Printf("ipfs.Object.Open(%s)", o)
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	log.Infof("ipfs.Object.Open(%s)", o)
 	return o.open(ctx)
 }
-
-// func (o *IPFSObject) Read(ctx context.Context, dest []byte, off int64) (int, error) {
-// 	o.mu.Lock()
-// 	defer o.mu.Unlock()
-// 	return o.read(ctx, dest, off)
-// }

@@ -4,9 +4,9 @@ import (
 	"context"
 	"ipfs-go-storage/config"
 	"ipfs-go-storage/ipfs"
+	"ipfs-go-storage/ipfs/objectset"
 	"ipfs-go-storage/mount"
 	"ipfs-go-storage/vfs"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,61 +15,10 @@ import (
 
 const ObjectSetWatcherInterval = 60 * time.Second
 
-func RetreiveObjectSet(ctx context.Context, connector *ipfs.Connector) (map[string]vfs.VFSObject, error) {
-	objectset := make(map[string]vfs.VFSObject)
-
-	data := map[string]string{
-		"/Anime/Kusuriya no Hitorigoto TV-2 01.mkv": "QmRR2wi98aHLfGf8Nu5MxM33BTrChyaQ9phNCHH2RF78WC",
-	}
-
-	for path, id := range data {
-		obj, err := ipfs.NewIPFSObject(connector, id)
-		if err != nil {
-			return nil, err
-		}
-
-		objectset[path] = obj
-	}
-
-	return objectset, nil
-}
-
-func updateObjectSet(ctx context.Context, connector *ipfs.Connector, vfs *vfs.VFSRoot) error {
-	_, err := RetreiveObjectSet(ctx, connector)
-	if err != nil {
-		return err
-	}
-
-	// vfs.Update(objectset)
-	return nil
-}
-
-// objectSetWather retreives the IPNS path and CID it points to periodically
-// If the new ObjectSet is newer than the currently mounted, the VFS is updated.
-func objectSetWather(ctx context.Context, connector *ipfs.Connector, vfs *vfs.VFSRoot) {
-	// Ticker to periodically listen to updates
-	t := time.NewTicker(ObjectSetWatcherInterval)
-	defer t.Stop()
-
-	for {
-		select {
-		case <-t.C:
-			// Retreive the VFS ObjectSet from the IPNS/IPFS storage
-			err := updateObjectSet(ctx, connector, vfs)
-			if err != nil {
-				log.Printf("Error updating objectset: %v", err)
-			}
-		case <-ctx.Done():
-			log.Printf("Context cancelled, stopping objectset watcher...")
-			return
-		}
-	}
-}
-
 func RunMount(ctx context.Context, cfg *config.Config, mountPoint string, p2pPort int) {
 	cctx, cancel := context.WithCancel(ctx)
 
-	log.Println("Mounting ipfs-go-storage...")
+	log.Infof("Mounting ipfs-go-storage...")
 
 	// Create IPFS connector
 	connector, err := ipfs.NewConnector(cfg)
@@ -82,14 +31,24 @@ func RunMount(ctx context.Context, cfg *config.Config, mountPoint string, p2pPor
 		log.Fatal(err)
 	}
 
-	// Retreive the VFS ObjectSet from the IPNS/IPFS storage
-	objectset, err := RetreiveObjectSet(cctx, connector)
-	if err != nil {
+	osw := objectset.NewWatcher(cfg, connector)
+	if err := osw.Start(cctx); err != nil {
 		log.Fatal(err)
 	}
 
+	// Wait until we receive an ObjectSet or have a timeout. This will block
+	var o *objectset.ObjectSet
+
+	log.Infof("Waiting for initial ObjectSet...")
+	select {
+	case o = <-osw.Recv():
+		// All good, we can continue now
+	case <-time.After(ipfs.IPFSObjectSetTimeout):
+		log.Fatalf("Timeout waiting for initial ObjectSet")
+	}
+
 	// Create the VFS
-	fs := vfs.NewVFSRoot(objectset)
+	fs := vfs.NewVFSRoot(o.Objects)
 
 	// Mount the filesystem
 	mount, err := mount.NewMount(cctx, fs, mountPoint)
@@ -97,12 +56,26 @@ func RunMount(ctx context.Context, cfg *config.Config, mountPoint string, p2pPor
 		log.Fatal(err)
 	}
 
-	log.Printf("Mounted at %s", mount.MountPoint())
+	log.Infof("Mounted at %s", mount.MountPoint())
 
 	fs.Print()
 
-	// Start a watcher to update VFS
-	go objectSetWather(cctx, connector, fs)
+	// Start a goroutine to receive updates from the ObjectSetWatcher
+	go func() {
+		for {
+			select {
+			case o := <-osw.Recv():
+				if o == nil {
+					log.Infof("ObjectSetWatcher closed")
+					return
+				}
+				fs.UpdateObjectSet(cctx, o.Objects)
+				fs.Print()
+			case <-cctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Wait for a signal to shut down.
 	sigChan := make(chan os.Signal, 1)
@@ -112,13 +85,23 @@ func RunMount(ctx context.Context, cfg *config.Config, mountPoint string, p2pPor
 	// Cancel the context
 	cancel()
 
+	// Wait for ObjectSetWatcher to shut down
+	if err := osw.WaitDone(); err != nil {
+		log.Errorf("Error waiting for ObjectSetWatcher: %v", err)
+	}
+
 	// Wait for unmount
 	if err := mount.WaitDone(); err != nil {
-		log.Printf("Error waiting for unmount: %v", err)
+		log.Errorf("Error waiting for unmount: %v", err)
 	}
 
 	// Wait for IPFS connector shutdown
 	if err := connector.WaitDone(); err != nil {
-		log.Printf("Error waiting for IPFS connector shutdown: %v", err)
+		log.Errorf("Error waiting for IPFS connector shutdown: %v", err)
+	}
+
+	// Wait for ObjectSetWatcher shutdown
+	if err := osw.WaitDone(); err != nil {
+		log.Errorf("Error stopping ObjectSetWatcher: %v", err)
 	}
 }

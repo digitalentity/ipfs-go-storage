@@ -3,7 +3,6 @@ package vfs
 
 import (
 	"context"
-	"log"
 	"syscall"
 	"time"
 
@@ -35,16 +34,16 @@ var _ = (fs.FileReleaser)((*VFSObjectHandleImpl)(nil))
 var _ = (fs.FileReader)((*VFSObjectHandleImpl)(nil))
 
 func (fh *VFSObjectHandleImpl) Release(ctx context.Context) syscall.Errno {
-	log.Printf("VFSObjectHandleImpl.Release: %s", fh)
+	log.Debugf("VFSObjectHandleImpl.Release")
 	fh.fh.Close(ctx)
 	return 0
 }
 
 func (fh *VFSObjectHandleImpl) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	log.Printf("VFSObjectHandleImpl.Read: %s", fh)
+	log.Debugf("VFSObjectHandleImpl.Read, %d bytes at offset %d", len(dest), off)
 	cnt, err := fh.fh.Read(ctx, dest, off)
 	if err != nil {
-		log.Printf("VFSObject Read failed: %v", err)
+		log.Errorf("VFSObjectHandleImpl.Read failed: %v", err)
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:cnt]), 0
@@ -56,12 +55,13 @@ type VFSObjectNode struct {
 	obj  VFSObject
 }
 
+var _ = (fs.NodeReleaser)((*VFSObjectNode)(nil))
 var _ = (fs.NodeGetattrer)((*VFSObjectNode)(nil))
 var _ = (fs.NodeOpener)((*VFSObjectNode)(nil))
-var _ = (fs.NodeReleaser)((*VFSObjectNode)(nil))
 
 func (n *VFSObjectNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("VFSObjectNode.Getattr: %s", n)
+	log.Debugf("VFSObjectNode.Getattr: %s", n)
+
 	if n.obj == nil {
 		out.Mode = 0000
 		out.Nlink = 1
@@ -70,7 +70,7 @@ func (n *VFSObjectNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse
 
 	attr, err := n.obj.GetAttr(ctx)
 	if err != nil {
-		log.Printf("VFSObject GetAttr failed: %v", err)
+		log.Errorf("VFSObjectNode.Getattr failed: %v", err)
 		out.Mode = 0000
 		out.Nlink = 1
 		return syscall.EACCES
@@ -89,7 +89,7 @@ func (n *VFSObjectNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse
 }
 
 func (n *VFSObjectNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	log.Printf("VFSObjectNode.Open: %s", n)
+	log.Debugf("VFSObjectNode.Open: %s", n)
 
 	if n.obj == nil {
 		return nil, 0, syscall.EACCES
@@ -97,7 +97,7 @@ func (n *VFSObjectNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 
 	fh, err := n.obj.Open(ctx)
 	if err != nil {
-		log.Printf("VFSObject Open failed: %v", err)
+		log.Errorf("VFSObjectNode.Open failed: %v", err)
 		return nil, 0, syscall.EIO
 	}
 
@@ -107,26 +107,11 @@ func (n *VFSObjectNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 }
 
 func (n *VFSObjectNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
-	log.Printf("VFSObjectNode.Release: %s", n)
+	log.Debugf("VFSObjectNode.Release: %s", n)
 	return fh.(*VFSObjectHandleImpl).Release(ctx)
 }
 
 func (n *VFSObjectNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
-	log.Printf("VFSObjectNode.Flush: %s", n)
+	log.Debugf("VFSObjectNode.Flush: %s", n)
 	return 0
 }
-
-// func (n *VFSObjectNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-// 	log.Printf("VFSObjectNode.Read: %v", n)
-// 	if n.obj == nil {
-// 		return nil, syscall.EACCES
-// 	}
-
-// 	cnt, err := n.obj.Read(ctx, dest, off)
-// 	if err != nil {
-// 		log.Printf("VFSObject Read failed: %v", err)
-// 		return nil, syscall.EIO
-// 	}
-
-// 	return fuse.ReadResultData(dest[:cnt]), 0
-// }

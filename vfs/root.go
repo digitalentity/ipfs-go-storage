@@ -3,7 +3,6 @@ package vfs
 
 import (
 	"context"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +23,7 @@ type VFSRoot struct {
 var _ = (fs.NodeOnAdder)((*VFSRoot)(nil))
 
 func NewVFSRoot(objectset map[string]VFSObject) *VFSRoot {
+	log.Debugf("NewVFSRoot()")
 	root := &VFSRoot{}
 	root.objectset = objectset
 	return root
@@ -35,6 +35,8 @@ func NewVFSRoot(objectset map[string]VFSObject) *VFSRoot {
 func (r *VFSRoot) UpdateObjectSet(ctx context.Context, objectset map[string]VFSObject) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	log.Debugf("VFSRoot.UpdateObjectSet(): %d objects", len(objectset))
 
 	// Prune objects that no longer exist in the new objectset
 	for path, _ := range r.objectset {
@@ -120,9 +122,10 @@ func (r *VFSRoot) addObject(ctx context.Context, path string, obj VFSObject) {
 }
 
 func (r *VFSRoot) OnAdd(ctx context.Context) {
-	log.Printf("VFSRoot.OnAdd")
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	log.Debugf("VFSRoot.OnAdd")
 
 	for path, obj := range r.objectset {
 		r.addObject(ctx, path, obj)
@@ -130,18 +133,19 @@ func (r *VFSRoot) OnAdd(ctx context.Context) {
 }
 
 func (r *VFSRoot) Print() {
-	log.Printf("VFSRoot.Print")
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	log.Debugf("VFSRoot.Print")
 
 	// Walk the Inode tree and print the hierarchy
 	var printInode func(inode *fs.Inode, indent string)
 	printInode = func(inode *fs.Inode, indent string) {
 		if inode == &r.Inode {
-			log.Printf("%s/", indent)
+			log.Debugf("%s/", indent)
 		} else {
 			name, _ := inode.Parent()
-			log.Printf("%s- %s (%s)", indent, name, inode.StableAttr())
+			log.Debugf("%s- %s (%s)", indent, name, inode.StableAttr())
 		}
 
 		for _, child := range inode.Children() {
