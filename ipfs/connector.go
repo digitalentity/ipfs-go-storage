@@ -5,26 +5,28 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"ipfs-go-storage/config"
 	"log"
 	"time"
 
-	bsclient "github.com/ipfs/boxo/bitswap/client"
-	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	"github.com/ipfs/boxo/blockservice"
-	blockstore "github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/files"
 	"github.com/ipfs/boxo/ipld/merkledag"
-	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
-	format "github.com/ipfs/go-ipld-format"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	eventbus "github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+
+	bsclient "github.com/ipfs/boxo/bitswap/client"
+	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
+	blockstore "github.com/ipfs/boxo/blockstore"
+	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
+	format "github.com/ipfs/go-ipld-format"
+	eventbus "github.com/libp2p/go-libp2p/core/event"
 )
 
 const IPFSFetchTimeout = 1 * time.Second
@@ -36,7 +38,7 @@ var (
 
 type Connector struct {
 	// Initial settings
-	port int
+	cfg *config.Config
 
 	// Private and Public keys for a new LibP2P Host
 	privKey  crypto.PrivKey
@@ -53,11 +55,11 @@ type Connector struct {
 }
 
 // NewConnector creates a new IPFSConnector.
-func NewConnector(peerAddr string, listenPort int) (*Connector, error) {
+func NewConnector(cfg *config.Config) (*Connector, error) {
 	r := rand.Reader
 
 	// Turn the targetPeer into a multiaddr.
-	maddr, err := multiaddr.NewMultiaddr(peerAddr)
+	maddr, err := multiaddr.NewMultiaddr(cfg.IPFS.PeerAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +77,7 @@ func NewConnector(peerAddr string, listenPort int) (*Connector, error) {
 	}
 
 	ipfs := &Connector{
-		port:     listenPort,
+		cfg:      cfg,
 		peerInfo: info,
 		privKey:  priv,
 		pubKey:   pub,
@@ -120,7 +122,7 @@ func (c *Connector) Start(ctx context.Context) error {
 
 	// Basic LibP2P options
 	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", c.port)),
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", c.cfg.IPFS.Port)),
 		libp2p.Identity(c.privKey),
 	}
 
