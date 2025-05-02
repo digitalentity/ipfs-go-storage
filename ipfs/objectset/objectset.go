@@ -21,21 +21,26 @@ type ObjectSet struct {
 	Objects    map[string]vfs.VFSObject
 }
 
-type RawObjectSet struct {
-	Namespace  string
-	LastUpdate time.Time
-	Objects    map[string]string
+type rawObject struct {
+	Cid   string
+	Mtime time.Time
 }
 
-func UnmarshallRawObjectSet(data []byte) (*RawObjectSet, error) {
-	var raw RawObjectSet
+type rawObjectSet struct {
+	Namespace  string
+	LastUpdate time.Time
+	Objects    map[string]rawObject
+}
+
+func UnmarshallRawObjectSet(data []byte) (*rawObjectSet, error) {
+	var raw rawObjectSet
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&raw); err != nil {
 		return nil, err
 	}
 	return &raw, nil
 }
 
-func MarshallRawObjectSet(raw *RawObjectSet) ([]byte, error) {
+func MarshallRawObjectSet(raw *rawObjectSet) ([]byte, error) {
 	var b bytes.Buffer
 	if err := gob.NewEncoder(&b).Encode(raw); err != nil {
 		return nil, err
@@ -43,11 +48,11 @@ func MarshallRawObjectSet(raw *RawObjectSet) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func (ro *RawObjectSet) ObjectSet(connector *ipfs.Connector) (*ObjectSet, error) {
+func (ro *rawObjectSet) ObjectSet(connector *ipfs.Connector) (*ObjectSet, error) {
 	objectset := make(map[string]vfs.VFSObject)
 
-	for path, id := range ro.Objects {
-		obj, err := ipfs.NewObject(connector, id)
+	for path, r := range ro.Objects {
+		obj, err := ipfs.NewObject(connector, r.Cid, r.Mtime)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +74,7 @@ type ObjectSetWatcher struct {
 
 	// Cached RawObjectSet
 	mu  sync.Mutex
-	ros *RawObjectSet
+	ros *rawObjectSet
 
 	// We deliver received objectsets here
 	c      chan *ObjectSet
@@ -81,10 +86,10 @@ func NewWatcher(cfg *config.Config, ipfs *ipfs.Connector) *ObjectSetWatcher {
 	osw := &ObjectSetWatcher{
 		cfg:       cfg,
 		connector: ipfs,
-		ros: &RawObjectSet{
+		ros: &rawObjectSet{
 			Namespace:  "default",
 			LastUpdate: time.Unix(0, 0),
-			Objects:    make(map[string]string),
+			Objects:    make(map[string]rawObject),
 		},
 		mu:   sync.Mutex{},
 		c:    make(chan *ObjectSet),
@@ -94,7 +99,7 @@ func NewWatcher(cfg *config.Config, ipfs *ipfs.Connector) *ObjectSetWatcher {
 	return osw
 }
 
-func (o *ObjectSetWatcher) processUpdate(ctx context.Context, newros *RawObjectSet) {
+func (o *ObjectSetWatcher) processUpdate(ctx context.Context, newros *rawObjectSet) {
 	log.Debugf("ObjectSetWatcher.processUpdate()")
 
 	o.mu.Lock()
@@ -138,11 +143,11 @@ func (o *ObjectSetWatcher) update(ctx context.Context) {
 }
 
 func (o *ObjectSetWatcher) Start(ctx context.Context) error {
-	// testros := &RawObjectSet{
+	// testros := &rawObjectSet{
 	// 	Namespace:  "default",
 	// 	LastUpdate: time.Now(),
-	// 	Objects: map[string]string{
-	// 		"/Anime/Kusuriya no Hitorigoto TV-2 01.mkv": "QmRR2wi98aHLfGf8Nu5MxM33BTrChyaQ9phNCHH2RF78WC",
+	// 	Objects: map[string]rawObject{
+	// 		"/Anime/Kusuriya no Hitorigoto TV-2 01.mkv": {Cid: "QmRR2wi98aHLfGf8Nu5MxM33BTrChyaQ9phNCHH2RF78WC", Mtime: time.Now()},
 	// 	},
 	// }
 	// o.processUpdate(ctx, testros)

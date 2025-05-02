@@ -23,6 +23,7 @@ type MemCacheDatastore struct {
 	values map[ipfsds.Key]item
 }
 
+var _ ipfsds.Datastore = (*MemCacheDatastore)(nil)
 var _ ipfsds.Batching = (*MemCacheDatastore)(nil)
 
 func NewMemCacheDatastore(ttl time.Duration) *MemCacheDatastore {

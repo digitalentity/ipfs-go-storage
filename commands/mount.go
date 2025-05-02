@@ -15,7 +15,7 @@ import (
 
 const ObjectSetWatcherInterval = 60 * time.Second
 
-func RunMount(ctx context.Context, cfg *config.Config, mountPoint string, p2pPort int) {
+func RunMount(ctx context.Context, cfg *config.Config, mountPoint string) {
 	cctx, cancel := context.WithCancel(ctx)
 
 	log.Infof("Mounting ipfs-go-storage...")

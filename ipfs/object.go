@@ -27,7 +27,7 @@ type Object struct {
 	errorTimeout time.Time // Error timeout
 }
 
-func NewObject(ipfs *Connector, id string) (*Object, error) {
+func NewObject(ipfs *Connector, id string, mt time.Time) (*Object, error) {
 	c, err := cid.Parse(id)
 	if err != nil {
 		return nil, err
@@ -36,7 +36,7 @@ func NewObject(ipfs *Connector, id string) (*Object, error) {
 	return &Object{
 		ipfs:      ipfs,
 		cid:       c,
-		attr:      vfs.VFSObjectAttr{ModTime: time.Now()},
+		attr:      vfs.VFSObjectAttr{ModTime: mt},
 		attrValid: false,
 	}, nil
 }
