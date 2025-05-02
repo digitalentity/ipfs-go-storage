@@ -20,12 +20,15 @@ import (
 	format "github.com/ipfs/go-ipld-format"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	eventbus "github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
 const IPFSFetchTimeout = 1 * time.Second
+const IPFSHealthcheckTicker = 10 * time.Second
 
 var (
 	ErrorNotAFile = errors.New("CID is not a UnixFile")
@@ -41,9 +44,12 @@ type Connector struct {
 	peerInfo *peer.AddrInfo
 
 	// Run-time state
-	host  host.Host
-	bswap *bsclient.Client
-	dsvc  format.DAGService
+	ticker *time.Ticker
+	host   host.Host
+	bswap  *bsclient.Client
+	dsvc   format.DAGService
+	evsub  eventbus.Subscription
+	done   chan bool
 }
 
 // NewConnector creates a new IPFSConnector.
@@ -73,9 +79,39 @@ func NewConnector(peerAddr string, listenPort int) (*Connector, error) {
 		peerInfo: info,
 		privKey:  priv,
 		pubKey:   pub,
+		done:     make(chan bool),
 	}
 
 	return ipfs, nil
+}
+
+func (c *Connector) connectionHealthcheck(ctx context.Context) {
+	log.Printf("ipfs.Connector.connectionHealthcheck()")
+
+	// for _, conn := range c.host.Network().Conns() {
+	// 	log.Printf("Connection to %s: %v", conn.RemotePeer().String(), conn.Stat().Stats)
+	// }
+
+	// Check if we are connected to the target peer
+	if c.host.Network().Connectedness(c.peerInfo.ID) == network.NotConnected {
+		log.Printf("Not connected to %s, reconnecting...", c.peerInfo.ID.String())
+		if err := c.host.Connect(ctx, *c.peerInfo); err == nil {
+			log.Printf("Reconnected to %s", c.peerInfo.String())
+		}
+	}
+}
+
+func (c *Connector) eventListener(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.ticker.C:
+			c.connectionHealthcheck(ctx)
+		case evt := <-c.evsub.Out():
+			log.Printf("Event: %v", evt)
+		}
+	}
 }
 
 // Start starts the IPFSConnector. On shutdown user must call Close()
@@ -108,25 +144,59 @@ func (c *Connector) Start(ctx context.Context) error {
 	c.bswap = bsclient.New(ctx, bsn, nil, blockstore.NewBlockstore(datastore.NewNullDatastore()))
 	bsn.Start(c.bswap)
 
-	// Connect to the target peer
-	if err = c.host.Connect(ctx, *c.peerInfo); err != nil {
+	// Create a new DAGService
+	c.dsvc = merkledag.NewReadOnlyDagService(merkledag.NewSession(ctx, merkledag.NewDAGService(blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), c.bswap))))
+
+	// Subscribe to event bus
+	if c.evsub, err = c.host.EventBus().Subscribe(eventbus.WildcardSubscription); err != nil {
 		c.bswap.Close()
 		c.host.Close()
 		return err
 	}
 
-	log.Printf("Connected to %s", c.peerInfo.String())
+	// Create a ticker
+	c.ticker = time.NewTicker(IPFSHealthcheckTicker)
 
-	// Create a new DAGService
-	c.dsvc = merkledag.NewReadOnlyDagService(merkledag.NewSession(ctx, merkledag.NewDAGService(blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), c.bswap))))
+	// Start the eventListener goroutine
+	go c.eventListener(ctx)
+
+	// Connect to the target peer
+	if err = c.host.Connect(ctx, *c.peerInfo); err != nil {
+		log.Printf("Failed to connect to %s: %s", c.peerInfo.String(), err.Error())
+		// c.bswap.Close()
+		// c.host.Close()
+		// return err
+	} else {
+		log.Printf("Connected to %s", c.peerInfo.String())
+	}
+
+	// Start the goroutine to execute a graceful shutdown
+	go func() {
+		<-ctx.Done()
+		log.Printf("Context cancelled, shutting down IPFS connector...")
+		c.Close()
+	}()
 
 	return nil
 }
 
 func (c *Connector) Close() error {
+	log.Printf("ipfs.Connector.Close()")
+	c.evsub.Close()
 	c.bswap.Close()
 	c.host.Close()
+	c.ticker.Stop()
+	c.done <- true
 	return nil
+}
+
+func (c *Connector) WaitDone() error {
+	select {
+	case <-c.done:
+		return nil
+	case <-time.After(time.Second * 5):
+		return fmt.Errorf("timeout waiting for IPFS connector to close")
+	}
 }
 
 func (c *Connector) GetUnixfile(ctx context.Context, id cid.Cid) (files.Node, error) {

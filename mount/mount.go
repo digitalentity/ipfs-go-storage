@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -27,11 +25,15 @@ type Mount interface {
 
 	// Unmounts the mount
 	Unmount() error
+
+	// WaitDone
+	WaitDone() error
 }
 
 type mount struct {
 	mountpoint string
 	server     *fuse.Server
+	done       chan bool
 }
 
 func (m *mount) MountPoint() string {
@@ -39,10 +41,20 @@ func (m *mount) MountPoint() string {
 }
 
 func (m *mount) Unmount() error {
+	log.Printf("Unmount(%s)", m.mountpoint)
 	if m.server == nil {
 		return fmt.Errorf("not mounted")
 	}
 	return m.server.Unmount()
+}
+
+func (m *mount) WaitDone() error {
+	select {
+	case <-m.done:
+		return nil
+	case <-time.After(MountTimeout):
+		return fmt.Errorf("timeout waiting for mount to close")
+	}
 }
 
 // Mount mounts the repository at the given mountpoint.
@@ -71,25 +83,17 @@ func NewMount(ctx context.Context, vfs fs.InodeEmbedder, mountpoint string) (Mou
 	m := &mount{
 		mountpoint: mountpoint,
 		server:     server,
+		done:       make(chan bool),
 	}
 
-	// Handle signals for graceful unmounting.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
+	// Start a function that would trigger the unmount
 	go func() {
-		select {
-		case sig := <-sigChan:
-			log.Printf("Received signal %v, unmounting...", sig)
-			if err := m.Unmount(); err != nil {
-				log.Printf("Failed to unmount: %v", err)
-			}
-			os.Exit(0)
-		case <-ctx.Done():
-			if err := m.Unmount(); err != nil {
-				log.Printf("Failed to unmount: %v", err)
-			}
+		<-ctx.Done()
+		log.Printf("Context cancelled, unmounting...")
+		if err := m.Unmount(); err != nil {
+			log.Printf("Failed to unmount: %v", err)
 		}
+		m.done <- true
 	}()
 
 	return m, nil
