@@ -11,7 +11,7 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-var log = logging.Logger("vfs")
+var log = logging.Logger("config")
 
 // Config represents the configuration for the ipfs-go-storage application
 type Config struct {
@@ -22,11 +22,13 @@ type Config struct {
 	Publisher struct {
 		PrivKey *PrivKey `json:"priv_key"`
 		PubKey  *PubKey  `json:"pub_key"`
+		UseMDNS bool     `json:"mdns"`
 	} `json:"publisher"`
 
 	IPFS struct {
-		PeerAddr string `json:"peer_addr"`
-		Port     int    `json:"port"`
+		Bootstrap []string `json:"bootstrap"`
+		PeerAddr  string   `json:"peer_addr"`
+		Port      int      `json:"port"`
 	} `json:"ipfs"`
 
 	ObjectSet struct {
@@ -42,6 +44,7 @@ func NewEmptyConfig(configFile string) *Config {
 
 	cfg.Publisher.PrivKey = &PrivKey{}
 	cfg.Publisher.PubKey = &PubKey{}
+	cfg.Publisher.UseMDNS = false
 
 	cfg.IPFS.PeerAddr = "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWPzN6y3VHiWVTSqf4R3yuEWjtaZhjDPZhiYH7q1bBiGVi"
 	cfg.IPFS.Port = 4002
@@ -56,6 +59,8 @@ func NewConfigFromFile(configFile string) (*Config, error) {
 	if err := cfg.Load(); err != nil {
 		return nil, err
 	}
+
+	// log.Infof("Config: %+v", cfg)
 	return cfg, nil
 }
 

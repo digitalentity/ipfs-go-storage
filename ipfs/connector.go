@@ -14,6 +14,7 @@ import (
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/files"
 	"github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/boxo/ipld/unixfs/importer/balanced"
 	"github.com/ipfs/boxo/ipns"
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
@@ -24,11 +25,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multicodec"
 
 	bsclient "github.com/ipfs/boxo/bitswap/client"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	blockstore "github.com/ipfs/boxo/blockstore"
+	chunker "github.com/ipfs/boxo/chunker"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
+	uih "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
 	format "github.com/ipfs/go-ipld-format"
 )
 
@@ -315,4 +319,38 @@ func (c *Connector) FetchUnixFile(ctx context.Context, id cid.Cid) ([]byte, erro
 	log.Debugf("ipfs.Connector.FetchUnixFile(%s): %d bytes", id.String(), buf.Len())
 
 	return buf.Bytes(), nil
+}
+
+func (c *Connector) StoreUnixFile(ctx context.Context, data []byte) (cid.Cid, error) {
+	log.Debugf("ipfs.Connector.StoreUnixFile(%d bytes)", len(data))
+
+	// Create a new UnixFS file from the data
+	reader := bytes.NewReader(data)
+
+	// Create a UnixFS graph from our file, parameters described here but can be visualized at https://dag.ipfs.tech/
+	dbp := uih.DagBuilderParams{
+		Maxlinks:  uih.DefaultLinksPerBlock, // Default max of 174 links per block
+		RawLeaves: true,                     // Leave the actual file bytes untouched instead of wrapping them in a dag-pb protobuf wrapper
+		CidBuilder: cid.V1Builder{ // Use CIDv1 for all links
+			Codec:    uint64(multicodec.DagPb),
+			MhType:   uint64(multicodec.Sha2_256), // Use SHA2-256 as the hash function
+			MhLength: -1,                          // Use the default hash length for the given hash function (in this case 256 bits)
+		},
+		FileModTime: time.Now(),
+		Dagserv:     c.dsvc,
+		NoCopy:      false,
+	}
+
+	ufsBuilder, err := dbp.New(chunker.NewSizeSplitter(reader, chunker.DefaultBlockSize)) // Split the file up into fixed sized 256KiB chunks
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	nd, err := balanced.Layout(ufsBuilder) // Arrange the graph with a balanced layout
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	log.Debugf("ipfs.Connector.StoreUnixFile(): %s", nd.Cid().String())
+	return nd.Cid(), nil
 }
