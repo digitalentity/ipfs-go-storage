@@ -2,11 +2,15 @@ package objectset
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
+	"errors"
 	"ipfs-go-storage/ipfs"
 	"ipfs-go-storage/vfs"
 	"os"
 	"time"
+
+	"github.com/ipfs/boxo/ipns"
 )
 
 type RawObject struct {
@@ -50,6 +54,13 @@ func NewRawObjectSetFromFile(path string) (*RawObjectSet, error) {
 	}
 
 	return NewRawObjectSetFromBytes(data)
+}
+
+func NewRawObjectSetFromIPNS(ctx context.Context, connector *ipfs.Connector, key ipns.Name) (*RawObjectSet, error) {
+	log.Debugf("ObjectSetWatcher.ReadFromIPNS(%s)", key)
+
+	// Not implemented
+	return nil, errors.New("Not implemented")
 }
 
 func (ro *RawObjectSet) Marshall() ([]byte, error) {

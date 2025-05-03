@@ -77,29 +77,19 @@ func (o *ObjectSetWatcher) processUpdate(ctx context.Context, newros *RawObjectS
 	return nil
 }
 
-func (o *ObjectSetWatcher) update(ctx context.Context) {
-	log.Infof("ObjectSetWatcher.update()")
+func (o *ObjectSetWatcher) fetchAndProcessUpdate(ctx context.Context) error {
+	log.Debugf("ObjectSetWatcher.fetchAndProcessUpdate()")
 
-	// Fetch and process the new ObjectSet
-
-}
-
-func (o *ObjectSetWatcher) publish(ctx context.Context) {
-	log.Infof("ObjectSetWatcher.publish()")
-	// Publish the existing objectset on the IPFS
-	bt, err := o.ros.Marshall()
+	ros, err := NewRawObjectSetFromIPNS(ctx, o.connector, o.connector.GetIPNSKey())
 	if err != nil {
-		log.Errorf("Failed to marshall ObjectSet: %v", err)
-		return
+		return err
 	}
 
-	cid, err := o.connector.StoreUnixFile(ctx, bt)
-	if err != nil {
-		log.Errorf("Failed to store ObjectSet: %v", err)
-		return
+	if err := o.processUpdate(ctx, ros); err != nil {
+		return err
 	}
 
-	log.Infof("Stored new ObjectSet on IPFS: %s", cid.String())
+	return nil
 }
 
 func (o *ObjectSetWatcher) Start(ctx context.Context) error {
@@ -120,8 +110,8 @@ func (o *ObjectSetWatcher) Start(ctx context.Context) error {
 		}
 
 		// Start first update immediately
-		o.update(ctx)
-		o.publish(ctx)
+		o.fetchAndProcessUpdate(ctx)
+		o.Publish(ctx)
 
 		// Now do the polling loop for updates
 		o.ticker = time.NewTicker(ipfs.ObjectSetWatcherInterval)
@@ -129,8 +119,8 @@ func (o *ObjectSetWatcher) Start(ctx context.Context) error {
 		for {
 			select {
 			case <-o.ticker.C:
-				o.update(ctx)
-				o.publish(ctx)
+				o.fetchAndProcessUpdate(ctx)
+				o.Publish(ctx)
 			case <-ctx.Done():
 				log.Infof("Context cancelled, shutting down IPFS connector...")
 				o.Stop()
@@ -139,6 +129,24 @@ func (o *ObjectSetWatcher) Start(ctx context.Context) error {
 	}(ctx)
 
 	return nil
+}
+
+func (o *ObjectSetWatcher) Publish(ctx context.Context) {
+	log.Infof("ObjectSetWatcher.publish()")
+	// Publish the existing objectset on the IPFS
+	bt, err := o.ros.Marshall()
+	if err != nil {
+		log.Errorf("Failed to marshall ObjectSet: %v", err)
+		return
+	}
+
+	cid, err := o.connector.StoreUnixFile(ctx, bt)
+	if err != nil {
+		log.Errorf("Failed to store ObjectSet: %v", err)
+		return
+	}
+
+	log.Infof("Stored new ObjectSet on IPFS: %s", cid.String())
 }
 
 func (o *ObjectSetWatcher) Recv() chan *ObjectSet {

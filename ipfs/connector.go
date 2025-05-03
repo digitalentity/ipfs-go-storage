@@ -172,6 +172,14 @@ func (c *Connector) eventListener(ctx context.Context) {
 	}
 }
 
+func (c *Connector) GetBitswapID() peer.ID {
+	return c.bitswap.peerInfo.ID
+}
+
+func (c *Connector) GetIPNSKey() ipns.Name {
+	return c.ipns.ipnsKey
+}
+
 // Start starts the IPFSConnector. On shutdown user must call Close()
 func (c *Connector) Start(ctx context.Context) error {
 	var err error

@@ -103,7 +103,8 @@ func (n *VFSObjectNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 
 	// We don't return a filehandle since we don't really need one.
 	// The file content is immutable, so hint the kernel to cache the data.
-	return &VFSObjectHandleImpl{fh: fh}, fuse.FOPEN_KEEP_CACHE, 0
+	//return &VFSObjectHandleImpl{fh: fh}, fuse.FOPEN_KEEP_CACHE, 0
+	return &VFSObjectHandleImpl{fh: fh}, 0, 0
 }
 
 func (n *VFSObjectNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
